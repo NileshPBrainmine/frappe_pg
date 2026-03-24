@@ -155,23 +155,34 @@ def patched_commit(self):
         raise
 
 
-def patched_rollback(self):
+def patched_rollback(self, *, save_point=None):
     """
-    Enhanced rollback with error handling and logging.
+    Enhanced rollback with savepoint support and error handling.
+
+    Frappe v15 calls frappe.db.rollback(save_point=name) to roll back to a
+    specific savepoint. PostgreSQL uses "ROLLBACK TO SAVEPOINT <name>" syntax.
+    When save_point is None, performs a full transaction rollback.
 
     Args:
         self: PostgresDatabase instance
-
-    Returns:
-        Result from original rollback method
+        save_point: Optional savepoint name to rollback to. If provided,
+                    executes "ROLLBACK TO SAVEPOINT <name>" instead of
+                    a full rollback.
 
     Note:
         Errors during rollback are silently caught to prevent
         cascading errors during error handling.
     """
+    if save_point:
+        try:
+            import frappe.database.database
+            frappe.database.database.Database.sql(self, f"ROLLBACK TO SAVEPOINT {save_point}")
+        except Exception:
+            pass
+        return
     try:
         return _original_rollback(self)
-    except Exception as e:
+    except Exception:
         # Don't log rollback failures during error handling
         # as this can cause cascading errors
         pass
