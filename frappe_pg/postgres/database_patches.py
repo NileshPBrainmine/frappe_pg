@@ -133,7 +133,9 @@ def patched_sql(self, query, values=(), *args, **kwargs):
     is_txn_ctrl = any(q_up.startswith(pfx) for pfx in _TXN_CTRL_PREFIXES)
 
     sp_name: str | None = None
-    if not is_txn_ctrl and _in_active_transaction(self.con):
+    # frappe v15 uses self.conn; older versions used self.con
+    _db_conn = getattr(self, "conn", None) or getattr(self, "con", None)
+    if not is_txn_ctrl and _in_active_transaction(_db_conn):
         sp_name = _next_sp_name()
         try:
             _BASE_SQL(self, f"SAVEPOINT {sp_name}")

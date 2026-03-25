@@ -63,6 +63,32 @@ _INDEX_HINT_RE = re.compile(
 # Must be applied BEFORE sqlglot because sqlglot maps REGEXP → ~ (case-sensitive).
 _REGEXP_PRE_RE = re.compile(r"\bR(?:EGEXP|LIKE)\b", re.IGNORECASE)
 
+# Detect queries that contain MySQL-specific syntax and therefore need sqlglot.
+# Frappe's query_builder already emits PG-compatible SQL with double-quoted
+# identifiers ("col").  Passing those through sqlglot (read="mysql") causes
+# sqlglot to treat "col" as a MySQL string literal → 'col', corrupting every
+# such query.  We only run sqlglot when at least one MySQL marker is present.
+_MYSQL_MARKER_RE = re.compile(
+    r"`"                                            # backtick identifier
+    r"|\bIFNULL\s*\("                              # IFNULL(
+    r"|\bIF\s*\("                                  # IF(
+    r"|\bDATE_FORMAT\s*\("                         # DATE_FORMAT(
+    r"|\bGROUP_CONCAT\s*\("                        # GROUP_CONCAT(
+    r"|\bDATEDIFF\s*\("                            # DATEDIFF(
+    r"|\bTIMESTAMPDIFF\s*\("                       # TIMESTAMPDIFF(
+    r"|\bINSERT\s+IGNORE\b"                        # INSERT IGNORE
+    r"|\bREPLACE\s+INTO\b"                         # REPLACE INTO
+    r"|\bON\s+DUPLICATE\s+KEY\b"                   # ON DUPLICATE KEY
+    r"|\bR(?:EGEXP|LIKE)\b"                        # REGEXP / RLIKE
+    r"|\bRAND\s*\(\s*\)"                           # RAND()
+    r"|\bCURDATE\s*\(\s*\)"                        # CURDATE()
+    r"|\bFIND_IN_SET\s*\("                         # FIND_IN_SET(
+    r"|\bFIELD\s*\("                               # FIELD(
+    r"|\bCAST\s*\([^)]+\bAS\s+(?:UNSIGNED|SIGNED|CHAR)\b"  # CAST(x AS UNSIGNED/SIGNED/CHAR)
+    r"|\bISNULL\s*\(",                             # ISNULL(
+    re.IGNORECASE,
+)
+
 # DATEDIFF(a, b) → (a::date - b::date)  — pre-process so sqlglot doesn't
 # generate invalid CAST(AGE(...) AS BIGINT) which errors in PostgreSQL.
 _DATEDIFF_PRE_RE = re.compile(
@@ -446,8 +472,12 @@ def apply_all_query_transformations(query: str) -> str:
         # Pre-processing
         sql = _preprocess(query)
 
-        # Stage 1: sqlglot
-        transpiled = _sqlglot_transpile(sql)
+        # Stage 1: sqlglot — only for queries with MySQL-specific syntax.
+        # Queries from frappe's query_builder already use PG double-quoted
+        # identifiers; passing them through sqlglot (read="mysql") would
+        # corrupt "col" → 'col' (string literal instead of identifier).
+        needs_transform = bool(_MYSQL_MARKER_RE.search(sql))
+        transpiled = _sqlglot_transpile(sql) if needs_transform else None
 
         if transpiled:
             result = _post_sqlglot_fixups(transpiled)
