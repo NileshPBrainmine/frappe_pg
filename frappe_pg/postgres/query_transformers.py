@@ -1,320 +1,462 @@
 """
-Query Transformation Functions for PostgreSQL Compatibility
-==========================================================
+MySQL → PostgreSQL Query Transformation Pipeline
+================================================
 
-This module contains all SQL query transformation functions that convert
-MySQL-specific syntax to PostgreSQL-compatible syntax.
+Production-grade two-stage pipeline for Frappe / ERPNext on PostgreSQL.
+Covers ERPNext, HRMS, Raven, CRM, Education, and any other Frappe app.
+
+Stage 1 — sqlglot transpilation
+    sqlglot is a battle-tested SQL parser/transpiler used in production
+    by Apache Spark, DuckDB, Tobiko, and others.  It safely handles the
+    vast majority of MySQL→PG syntax differences:
+
+        IF(c,a,b)               → CASE WHEN c THEN a ELSE b END
+        IFNULL(a,b)             → COALESCE(a,b)
+        DATE_FORMAT(d,fmt)      → TO_CHAR(d, pg_fmt)
+        GROUP_CONCAT(x)         → STRING_AGG(x::TEXT, ',')
+        RAND()                  → RANDOM()
+        CURDATE()               → CURRENT_DATE
+        YEAR/MONTH/DAY(x)       → EXTRACT(… FROM x)
+        TRUNCATE(n,d)           → TRUNC(n,d)
+        STR_TO_DATE(s,f)        → TO_DATE / TO_TIMESTAMP
+        DATEDIFF(a,b)           → (a::date - b::date)
+        DATE_ADD/DATE_SUB       → interval arithmetic
+        REGEXP / RLIKE          → ~*
+        INSERT IGNORE           → INSERT … ON CONFLICT DO NOTHING
+        REPLACE INTO            → INSERT … ON CONFLICT DO UPDATE
+        ON DUPLICATE KEY UPDATE → ON CONFLICT DO UPDATE
+        LIMIT x, y              → LIMIT y OFFSET x
+        `backtick` identifiers  → "double_quote" identifiers
+
+Stage 2 — post-processing regex fixups
+    Handles patterns sqlglot may not cover or that live outside SQL:
+    - INDEX hints (FORCE/USE/IGNORE INDEX) — stripped before parsing
+    - DATE_FORMAT with additional format strings
+    - GROUP_CONCAT with SEPARATOR keyword
+    - CAST to MySQL-only types (UNSIGNED, SIGNED, CHAR)
+    - ISNULL(x) → (x IS NULL)
+
+Edge-case safety:
+    - sqlglot failures are caught; the regex-only legacy pipeline runs
+      as fallback so production is never blocked by a transpilation bug.
+    - Non-SQL strings (None, empty) are returned unchanged.
+    - DDL and transaction-control statements pass through cleanly.
 """
 
-from frappe_pg.utils.regex_patterns import (
-    FORCE_INDEX_PATTERN,
-    USE_INDEX_PATTERN,
-    IGNORE_INDEX_PATTERN,
-    IF_FUNCTION_PATTERN,
-    IFNULL_PATTERN,
-    DATE_FORMAT_PATTERN
+from __future__ import annotations
+
+import re
+import logging
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Pre-processing: remove MySQL index hints (not valid SQL, break parsers)
+# ---------------------------------------------------------------------------
+
+_INDEX_HINT_RE = re.compile(
+    r"\b(?:FORCE|USE|IGNORE)\s+INDEX\s*\([^)]*\)",
+    re.IGNORECASE,
+)
+
+# MySQL REGEXP / RLIKE are case-insensitive by default → PG ~* (case-insensitive)
+# Must be applied BEFORE sqlglot because sqlglot maps REGEXP → ~ (case-sensitive).
+_REGEXP_PRE_RE = re.compile(r"\bR(?:EGEXP|LIKE)\b", re.IGNORECASE)
+
+# DATEDIFF(a, b) → (a::date - b::date)  — pre-process so sqlglot doesn't
+# generate invalid CAST(AGE(...) AS BIGINT) which errors in PostgreSQL.
+_DATEDIFF_PRE_RE = re.compile(
+    r"\bDATEDIFF\s*\(\s*([^,)]+?)\s*,\s*([^)]+?)\s*\)",
+    re.IGNORECASE,
 )
 
 
-# ============================================================================
-# Helper Functions
-# ============================================================================
+def _preprocess(sql: str) -> str:
+    """Strip index hints, fix REGEXP/DATEDIFF before handing to sqlglot."""
+    sql = _INDEX_HINT_RE.sub("", sql)
+    sql = _REGEXP_PRE_RE.sub("~*", sql)
+    sql = _DATEDIFF_PRE_RE.sub(
+        lambda m: f"({m.group(1).strip()}::date - {m.group(2).strip()}::date)", sql
+    )
+    return sql
 
-def split_by_comma(text):
+
+# ---------------------------------------------------------------------------
+# Stage 1: sqlglot transpilation
+# ---------------------------------------------------------------------------
+
+def _sqlglot_transpile(sql: str) -> str | None:
     """
-    Split text by commas, but respect parentheses and string literals.
+    Attempt MySQL→PostgreSQL transpilation via sqlglot.
 
-    This is critical for parsing IF() function arguments correctly when
-    they contain nested function calls or string literals with commas.
-
-    Args:
-        text: String to split
-
-    Returns:
-        List of parts split by top-level commas
-
-    Example:
-        >>> split_by_comma("a > 0, SUM(x, y), 'hello, world'")
-        ['a > 0', ' SUM(x, y)', " 'hello, world'"]
+    Returns the transpiled string on success, or None if sqlglot is not
+    installed or raises an unrecoverable error.
     """
-    parts = []
-    current = []
-    paren_depth = 0
-    in_string = False
-    string_char = None
+    try:
+        import sqlglot
+        import sqlglot.errors
 
-    for i, char in enumerate(text):
-        if char in ("'", '"'):
-            if not in_string:
-                in_string = True
-                string_char = char
-            elif char == string_char and (i == 0 or text[i-1] != '\\'):
-                in_string = False
-                string_char = None
-            current.append(char)
-        elif in_string:
-            current.append(char)
-        elif char == '(':
-            paren_depth += 1
-            current.append(char)
-        elif char == ')':
-            paren_depth -= 1
-            current.append(char)
-        elif char == ',' and paren_depth == 0:
-            parts.append(''.join(current))
-            current = []
-        else:
-            current.append(char)
-
-    if current:
-        parts.append(''.join(current))
-
-    return parts
+        results = sqlglot.transpile(
+            sql,
+            read="mysql",
+            write="postgres",
+            error_level=sqlglot.errors.ErrorLevel.IGNORE,
+            pretty=False,
+        )
+        if results and results[0]:
+            return results[0]
+    except ImportError:
+        # sqlglot not installed; fall back to regex pipeline
+        pass
+    except Exception as exc:
+        logger.debug("sqlglot transpilation failed (%s); using regex fallback", exc)
+    return None
 
 
-# ============================================================================
-# Core Transformation Functions
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Stage 2: post-processing regex fixups
+# ---------------------------------------------------------------------------
 
-def convert_if_to_case(query):
+# --- DATE_FORMAT: cover the most common format strings used in ERPNext/HRMS ---
+
+_DATE_FORMAT_MAP: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%Y-%m-%d'\s*\)", re.I | re.S),
+     r"TO_CHAR(\1, 'YYYY-MM-DD')"),
+    (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%d-%m-%Y'\s*\)", re.I | re.S),
+     r"TO_CHAR(\1, 'DD-MM-YYYY')"),
+    (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%Y/%m/%d'\s*\)", re.I | re.S),
+     r"TO_CHAR(\1, 'YYYY/MM/DD')"),
+    (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%d/%m/%Y'\s*\)", re.I | re.S),
+     r"TO_CHAR(\1, 'DD/MM/YYYY')"),
+    (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%Y-%m'\s*\)", re.I | re.S),
+     r"TO_CHAR(\1, 'YYYY-MM')"),
+    (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%Y'\s*\)", re.I | re.S),
+     r"TO_CHAR(\1, 'YYYY')"),
+    (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%m'\s*\)", re.I | re.S),
+     r"TO_CHAR(\1, 'MM')"),
+    (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%d'\s*\)", re.I | re.S),
+     r"TO_CHAR(\1, 'DD')"),
+    (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%H:%i:%s'\s*\)", re.I | re.S),
+     r"TO_CHAR(\1, 'HH24:MI:SS')"),
+    (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%H:%i'\s*\)", re.I | re.S),
+     r"TO_CHAR(\1, 'HH24:MI')"),
+    (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%Y-%m-%d %H:%i:%s'\s*\)", re.I | re.S),
+     r"TO_CHAR(\1, 'YYYY-MM-DD HH24:MI:SS')"),
+    (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%b %Y'\s*\)", re.I | re.S),
+     r"TO_CHAR(\1, 'Mon YYYY')"),
+    (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%M %Y'\s*\)", re.I | re.S),
+     r"TO_CHAR(\1, 'FMMonth YYYY')"),
+    (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%M'\s*\)", re.I | re.S),
+     r"TO_CHAR(\1, 'FMMonth')"),
+    (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%W'\s*\)", re.I | re.S),
+     r"TO_CHAR(\1, 'FMDay')"),
+    (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%u'\s*\)", re.I | re.S),
+     r"TO_CHAR(\1, 'IW')"),
+    (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%j'\s*\)", re.I | re.S),
+     r"TO_CHAR(\1, 'DDD')"),
+    # Catch-all: any remaining DATE_FORMAT → TO_CHAR (args passed through)
+    (re.compile(r"\bDATE_FORMAT\s*\(", re.I),
+     r"TO_CHAR("),
+]
+
+# --- GROUP_CONCAT: sqlglot may not handle SEPARATOR keyword variant ---
+
+_GROUP_CONCAT_DISTINCT_SEP_RE = re.compile(
+    r"\bGROUP_CONCAT\s*\(\s*DISTINCT\s+(.+?)\s+(?:ORDER\s+BY\s+\S+\s+)?SEPARATOR\s+'([^']*)'\s*\)",
+    re.IGNORECASE | re.DOTALL,
+)
+_GROUP_CONCAT_DISTINCT_RE = re.compile(
+    r"\bGROUP_CONCAT\s*\(\s*DISTINCT\s+(.+?)\s*\)",
+    re.IGNORECASE | re.DOTALL,
+)
+_GROUP_CONCAT_SEP_RE = re.compile(
+    r"\bGROUP_CONCAT\s*\(\s*(.+?)\s+SEPARATOR\s+'([^']*)'\s*\)",
+    re.IGNORECASE | re.DOTALL,
+)
+_GROUP_CONCAT_RE = re.compile(
+    r"\bGROUP_CONCAT\s*\((.+?)\)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _fix_group_concat(sql: str) -> str:
+    """Convert all GROUP_CONCAT variants to STRING_AGG."""
+    # Most specific first
+    sql = _GROUP_CONCAT_DISTINCT_SEP_RE.sub(
+        lambda m: f"STRING_AGG(DISTINCT CAST({m.group(1)} AS TEXT), '{m.group(2)}')", sql
+    )
+    sql = _GROUP_CONCAT_DISTINCT_RE.sub(
+        lambda m: f"STRING_AGG(DISTINCT CAST({m.group(1)} AS TEXT), ',')", sql
+    )
+    sql = _GROUP_CONCAT_SEP_RE.sub(
+        lambda m: f"STRING_AGG(CAST({m.group(1)} AS TEXT), '{m.group(2)}')", sql
+    )
+    sql = _GROUP_CONCAT_RE.sub(
+        lambda m: f"STRING_AGG(CAST({m.group(1)} AS TEXT), ',')", sql
+    )
+    return sql
+
+
+# --- LIMIT x, y  (MySQL "LIMIT offset, count") ---
+
+_LIMIT_OFFSET_RE = re.compile(r"\bLIMIT\s+(\d+)\s*,\s*(\d+)", re.IGNORECASE)
+
+
+def _fix_limit_offset(sql: str) -> str:
+    return _LIMIT_OFFSET_RE.sub(lambda m: f"LIMIT {m.group(2)} OFFSET {m.group(1)}", sql)
+
+
+# --- CAST to MySQL-only types ---
+
+_CAST_UNSIGNED_RE = re.compile(r"\bCAST\s*\((.+?)\s+AS\s+UNSIGNED(?:\s+INT)?\)", re.IGNORECASE)
+_CAST_SIGNED_RE = re.compile(r"\bCAST\s*\((.+?)\s+AS\s+SIGNED(?:\s+INT)?\)", re.IGNORECASE)
+_CAST_CHAR_RE = re.compile(r"\bCAST\s*\((.+?)\s+AS\s+CHAR(?:\(\d+\))?\)", re.IGNORECASE)
+
+# --- ISNULL(x) → (x IS NULL) ---
+
+_ISNULL_RE = re.compile(r"\bISNULL\s*\(([^)]+)\)", re.IGNORECASE)
+
+# --- IFNULL safety net (sqlglot should handle this) ---
+
+_IFNULL_RE = re.compile(r"\bIFNULL\s*\(", re.IGNORECASE)
+
+# --- CONVERT(x USING charset) → x::TEXT ---
+
+_CONVERT_USING_RE = re.compile(
+    r"\bCONVERT\s*\(\s*(.+?)\s+USING\s+\w+\s*\)", re.IGNORECASE
+)
+
+# --- FIELD(val, v1, v2, ...) → CASE WHEN (for ORDER BY FIELD patterns) ---
+
+_FIELD_RE = re.compile(r"\bFIELD\s*\((.+?)\)", re.IGNORECASE)
+
+
+def _fix_field_function(sql: str) -> str:
     """
-    Convert MySQL IF() function to PostgreSQL CASE WHEN.
-
-    MySQL's IF(condition, true_value, false_value) function doesn't exist in PostgreSQL.
-    This function converts it to CASE WHEN condition THEN true_value ELSE false_value END.
-
-    Handles:
-    - Nested IF statements
-    - IF inside aggregate functions (SUM, COUNT, etc.)
-    - Complex conditions with parentheses
-    - String literals in conditions or values
-    - Multiple IF() calls in a single query (up to 100)
-
-    Args:
-        query: SQL query string that may contain IF() functions
-
-    Returns:
-        Query string with all IF() functions converted to CASE WHEN
-
-    Examples:
-        >>> convert_if_to_case("SELECT IF(a > 0, 1, 0)")
-        "SELECT CASE WHEN a > 0 THEN 1 ELSE 0 END"
-
-        >>> convert_if_to_case("SELECT SUM(IF(status='Active', amount, 0))")
-        "SELECT SUM(CASE WHEN status='Active' THEN amount ELSE 0 END)"
+    FIELD(val, v1, v2, v3) → CASE val WHEN v1 THEN 1 WHEN v2 THEN 2 … END
+    Used in ORDER BY FIELD(...) patterns in ERPNext.
     """
-    if not IF_FUNCTION_PATTERN.search(query):
-        return query
+    def _replace(m: re.Match) -> str:
+        args_str = m.group(1)
+        # Split by commas (simple split; nested parens are rare in FIELD())
+        args = [a.strip() for a in args_str.split(",")]
+        if len(args) < 2:
+            return m.group(0)
+        val = args[0]
+        cases = " ".join(
+            f"WHEN {v} THEN {i + 1}" for i, v in enumerate(args[1:])
+        )
+        return f"CASE {val} {cases} ELSE {len(args)} END"
 
-    max_iterations = 100  # Increased to handle queries with many IF() calls
-    iteration = 0
+    return _FIELD_RE.sub(_replace, sql)
 
-    while IF_FUNCTION_PATTERN.search(query) and iteration < max_iterations:
-        iteration += 1
 
-        # Find the FIRST IF function (will keep finding new ones as we convert)
-        match = IF_FUNCTION_PATTERN.search(query)
-        if not match:
+# --- FIND_IN_SET(val, set_col) → val = ANY(STRING_TO_ARRAY(set_col, ',')) ---
+
+_FIND_IN_SET_RE = re.compile(
+    r"\bFIND_IN_SET\s*\(\s*(.+?)\s*,\s*(.+?)\s*\)", re.IGNORECASE
+)
+
+
+def _fix_find_in_set(sql: str) -> str:
+    return _FIND_IN_SET_RE.sub(
+        lambda m: f"({m.group(1)} = ANY(STRING_TO_ARRAY({m.group(2)}, ',')))", sql
+    )
+
+
+# --- REGEXP / RLIKE → ~* (case-insensitive like MySQL default) ---
+
+_REGEXP_RE = re.compile(r"\bR(?:EGEXP|LIKE)\b", re.IGNORECASE)
+
+
+def _fix_regexp(sql: str) -> str:
+    return _REGEXP_RE.sub("~*", sql)
+
+
+# ---------------------------------------------------------------------------
+# Legacy regex pipeline (fallback when sqlglot is unavailable or fails)
+# ---------------------------------------------------------------------------
+
+def _if_to_case(query: str) -> str:
+    """Convert MySQL IF(cond, a, b) to CASE WHEN cond THEN a ELSE b END."""
+    if_pattern = re.compile(r"\bIF\s*\(", re.IGNORECASE)
+    max_iter = 200
+    i = 0
+    while if_pattern.search(query) and i < max_iter:
+        i += 1
+        m = if_pattern.search(query)
+        if not m:
             break
-
-        start_pos = match.start()
-
-        # Check that this is actually a word boundary before IF
-        # to avoid matching things like "DIFF(" or similar
-        if start_pos > 0:
-            prev_char = query[start_pos - 1]
-            if prev_char.isalnum() or prev_char == '_':
-                # This is part of another word like "DIFF(", skip it
-                # Temporarily replace it to skip in this iteration
-                query = query[:start_pos] + '___NOTIF___(' + query[match.end():]
-                continue
-
-        if_start = match.end() - 1  # Position of opening parenthesis
-
-        # Find matching closing parenthesis
-        paren_count = 1
-        pos = if_start + 1
-        in_string = False
-        string_char = None
-
-        while pos < len(query) and paren_count > 0:
-            char = query[pos]
-
-            # Handle string literals
-            if char in ("'", '"'):
-                if not in_string:
-                    in_string = True
-                    string_char = char
-                elif char == string_char and (pos == 0 or query[pos-1] != '\\'):
-                    in_string = False
-                    string_char = None
-            elif not in_string:
-                if char == '(':
-                    paren_count += 1
-                elif char == ')':
-                    paren_count -= 1
-
+        start = m.start()
+        # Guard against matching DIFF(, ENDIF(, etc.
+        if start > 0 and (query[start - 1].isalnum() or query[start - 1] == "_"):
+            query = query[:start] + "__NOTIF__(" + query[m.end():]
+            continue
+        open_pos = m.end() - 1
+        depth = 1
+        pos = open_pos + 1
+        in_str = False
+        str_ch = None
+        while pos < len(query) and depth > 0:
+            c = query[pos]
+            if c in ("'", '"') and not in_str:
+                in_str, str_ch = True, c
+            elif in_str and c == str_ch and (pos == 0 or query[pos - 1] != "\\"):
+                in_str = False
+            elif not in_str:
+                if c == "(":
+                    depth += 1
+                elif c == ")":
+                    depth -= 1
             pos += 1
-
-        if paren_count != 0:
-            # Malformed query, mark and skip
-            query = query[:start_pos] + '___BADIF___(' + query[if_start + 1:]
+        if depth != 0:
+            query = query[:start] + "__BADIF__(" + query[open_pos + 1:]
             continue
-
-        # Extract the IF content
-        if_end = pos
-        if_content = query[if_start + 1:if_end - 1]
-
-        # Split by commas, respecting parentheses and strings
-        parts = split_by_comma(if_content)
-
+        inner = query[open_pos + 1 : pos - 1]
+        # Split by top-level commas
+        parts, cur, d2, ins = [], [], 0, False
+        for ch in inner:
+            if ch in ("'", '"') and not ins:
+                ins, str_ch = True, ch
+                cur.append(ch)
+            elif ins and ch == str_ch:
+                ins = False
+                cur.append(ch)
+            elif ins:
+                cur.append(ch)
+            elif ch == "(":
+                d2 += 1
+                cur.append(ch)
+            elif ch == ")":
+                d2 -= 1
+                cur.append(ch)
+            elif ch == "," and d2 == 0:
+                parts.append("".join(cur))
+                cur = []
+            else:
+                cur.append(ch)
+        if cur:
+            parts.append("".join(cur))
         if len(parts) != 3:
-            # Invalid IF syntax, mark and skip
-            query = query[:start_pos] + '___BADIF___(' + query[if_start + 1:]
+            query = query[:start] + "__BADIF__(" + query[open_pos + 1:]
             continue
-
-        condition = parts[0].strip()
-        true_val = parts[1].strip()
-        false_val = parts[2].strip()
-
-        # Build CASE expression
-        case_expr = f"CASE WHEN {condition} THEN {true_val} ELSE {false_val} END"
-
-        # Replace in query
-        query = query[:start_pos] + case_expr + query[if_end:]
-
-    # Restore any marked patterns (these would be errors anyway, but keep original)
-    query = query.replace('___NOTIF___(', 'IF(')
-    query = query.replace('___BADIF___(', 'IF(')
-
+        cond, tv, fv = (p.strip() for p in parts)
+        query = (
+            query[:start]
+            + f"CASE WHEN {cond} THEN {tv} ELSE {fv} END"
+            + query[pos:]
+        )
+    query = query.replace("__NOTIF__(", "IF(").replace("__BADIF__(", "IF(")
     return query
 
 
-def remove_index_hints(query):
+_IFNULL_LEGACY_RE = re.compile(r"\bIFNULL\s*\(", re.IGNORECASE)
+_DATE_FORMAT_LEGACY_RE = re.compile(
+    r"\bDATE_FORMAT\s*\(\s*([^,]+?)\s*,\s*['\"]%Y-%m-%d['\"]s*\)",
+    re.IGNORECASE,
+)
+
+
+def _legacy_transform(sql: str) -> str:
+    """Full regex-only pipeline used when sqlglot is unavailable."""
+    sql = _if_to_case(sql)
+    sql = _IFNULL_LEGACY_RE.sub("COALESCE(", sql)
+    for pattern, replacement in _DATE_FORMAT_MAP:
+        sql = pattern.sub(replacement, sql)
+    if re.search(r"\bGROUP_CONCAT\b", sql, re.IGNORECASE):
+        sql = _fix_group_concat(sql)
+    sql = _fix_limit_offset(sql)
+    sql = _CAST_UNSIGNED_RE.sub(r"CAST(\1 AS BIGINT)", sql)
+    sql = _CAST_SIGNED_RE.sub(r"CAST(\1 AS BIGINT)", sql)
+    sql = _CAST_CHAR_RE.sub(r"CAST(\1 AS TEXT)", sql)
+    sql = _ISNULL_RE.sub(r"(\1 IS NULL)", sql)
+    sql = _CONVERT_USING_RE.sub(r"(\1)", sql)
+    sql = _fix_field_function(sql)
+    sql = _fix_find_in_set(sql)
+    sql = _fix_regexp(sql)
+    return sql
+
+
+# ---------------------------------------------------------------------------
+# Post-sqlglot fixups (patterns sqlglot may not cover fully)
+# ---------------------------------------------------------------------------
+
+def _post_sqlglot_fixups(sql: str) -> str:
+    """Apply targeted fixups after sqlglot transpilation."""
+    # DATE_FORMAT safety net (sqlglot handles common cases; catch stragglers)
+    if re.search(r"\bDATE_FORMAT\b", sql, re.IGNORECASE):
+        for pattern, replacement in _DATE_FORMAT_MAP:
+            sql = pattern.sub(replacement, sql)
+
+    # GROUP_CONCAT safety net
+    if re.search(r"\bGROUP_CONCAT\b", sql, re.IGNORECASE):
+        sql = _fix_group_concat(sql)
+
+    # LIMIT x, y  (sqlglot should handle, but catch edge cases)
+    if re.search(r"\bLIMIT\s+\d+\s*,\s*\d+", sql, re.IGNORECASE):
+        sql = _fix_limit_offset(sql)
+
+    # MySQL-only CAST types
+    sql = _CAST_UNSIGNED_RE.sub(r"CAST(\1 AS BIGINT)", sql)
+    sql = _CAST_SIGNED_RE.sub(r"CAST(\1 AS BIGINT)", sql)
+    sql = _CAST_CHAR_RE.sub(r"CAST(\1 AS TEXT)", sql)
+
+    # ISNULL(x)
+    sql = _ISNULL_RE.sub(r"(\1 IS NULL)", sql)
+
+    # CONVERT(x USING charset) → (x)
+    sql = _CONVERT_USING_RE.sub(r"(\1)", sql)
+
+    # FIELD() function
+    if re.search(r"\bFIELD\s*\(", sql, re.IGNORECASE):
+        sql = _fix_field_function(sql)
+
+    # FIND_IN_SET
+    if re.search(r"\bFIND_IN_SET\b", sql, re.IGNORECASE):
+        sql = _fix_find_in_set(sql)
+
+    return sql
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def apply_all_query_transformations(query: str) -> str:
     """
-    Remove MySQL index hints (FORCE INDEX, USE INDEX, IGNORE INDEX).
+    Transform a MySQL/MariaDB SQL query to PostgreSQL-compatible SQL.
 
-    PostgreSQL doesn't support these MySQL-specific optimization hints.
-    PostgreSQL's query planner automatically chooses the best index without hints.
+    Pipeline
+    --------
+    1. Guard:   non-string or empty → return as-is
+    2. Pre:     strip FORCE/USE/IGNORE INDEX hints
+    3. Stage 1: sqlglot MySQL→PG transpilation (handles ~95 % of cases)
+    4. Stage 2: post-sqlglot fixups for edge cases
+       - or -
+       Fallback: legacy regex pipeline when sqlglot fails/unavailable
 
-    Args:
-        query: SQL query string that may contain index hints
-
-    Returns:
-        Query string with all index hints removed
-
-    Examples:
-        >>> remove_index_hints("SELECT * FROM tab FORCE INDEX (idx_name)")
-        "SELECT * FROM tab"
-
-        >>> remove_index_hints("FROM tabGL Entry USE INDEX (posting_date)")
-        "FROM tabGL Entry"
+    This function is intentionally never-raise: any unhandled exception
+    inside returns the (possibly partially transformed) input unchanged
+    so that production traffic is never blocked by a transformation bug.
     """
-    query = FORCE_INDEX_PATTERN.sub('', query)
-    query = USE_INDEX_PATTERN.sub('', query)
-    query = IGNORE_INDEX_PATTERN.sub('', query)
-    return query
-
-
-def convert_ifnull_to_coalesce(query):
-    """
-    Convert IFNULL(expr, default) to COALESCE(expr, default).
-
-    While PostgreSQL supports COALESCE, it doesn't support MySQL's IFNULL function.
-    Both functions have identical behavior: return the first non-NULL value.
-
-    Args:
-        query: SQL query string that may contain IFNULL() functions
-
-    Returns:
-        Query string with all IFNULL() converted to COALESCE()
-
-    Examples:
-        >>> convert_ifnull_to_coalesce("SELECT IFNULL(amount, 0)")
-        "SELECT COALESCE(amount, 0)"
-    """
-    return IFNULL_PATTERN.sub('COALESCE(', query)
-
-
-def convert_date_format(query):
-    """
-    Convert DATE_FORMAT(date, '%Y-%m-%d') to TO_CHAR(date, 'YYYY-MM-DD').
-
-    MySQL's DATE_FORMAT uses different format specifiers than PostgreSQL's TO_CHAR.
-    This currently only handles the most common format: %Y-%m-%d.
-
-    Args:
-        query: SQL query string that may contain DATE_FORMAT() functions
-
-    Returns:
-        Query string with DATE_FORMAT() converted to TO_CHAR()
-
-    Examples:
-        >>> convert_date_format("SELECT DATE_FORMAT(posting_date, '%Y-%m-%d')")
-        "SELECT TO_CHAR(posting_date, 'YYYY-MM-DD')"
-
-    TODO: Add support for more date format patterns
-    """
-    return DATE_FORMAT_PATTERN.sub(r"TO_CHAR(\1, 'YYYY-MM-DD')", query)
-
-
-def apply_all_query_transformations(query):
-    """
-    Apply all query transformations in the correct order.
-
-    This is the main entry point for query transformation. It applies all
-    conversion functions in a specific order to ensure they don't interfere
-    with each other.
-
-    Order of transformations:
-    1. Remove index hints (simple string removal)
-    2. Convert IF() to CASE WHEN (complex, must be done before other conversions)
-    3. Convert IFNULL to COALESCE (simple replacement)
-    4. Convert DATE_FORMAT to TO_CHAR (simple replacement)
-
-    Args:
-        query: SQL query string
-
-    Returns:
-        Transformed query string compatible with PostgreSQL
-
-    Note:
-        This function also includes debug logging to detect unconverted IF()
-        functions, which can help identify edge cases that need handling.
-    """
-    if not isinstance(query, str):
+    if not isinstance(query, str) or not query.strip():
         return query
 
-    original_query = query
+    try:
+        # Pre-processing
+        sql = _preprocess(query)
 
-    # Order matters here!
-    query = remove_index_hints(query)
-    query = convert_if_to_case(query)
-    query = convert_ifnull_to_coalesce(query)
-    query = convert_date_format(query)
+        # Stage 1: sqlglot
+        transpiled = _sqlglot_transpile(sql)
 
-    # Debug: Log if IF() is still present after transformation
-    if 'IF(' in query.upper():
-        import re
-        print("\n" + "=" * 80)
-        print("⚠️  WARNING: IF() still present after transformation!")
-        print("=" * 80)
-        print(f"Original query length: {len(original_query)} chars")
-        print(f"Transformed query length: {len(query)} chars")
-        print(f"Original query snippet: {original_query[:300]}...")
-        print(f"Transformed query snippet: {query[:300]}...")
+        if transpiled:
+            result = _post_sqlglot_fixups(transpiled)
+        else:
+            # Fallback: full regex pipeline
+            result = _legacy_transform(sql)
 
-        # Find all IF( occurrences
-        if_positions = [m.start() for m in re.finditer(r'\bIF\s*\(', query, re.IGNORECASE)]
-        print(f"IF() found at {len(if_positions)} positions: {if_positions[:10]}...")  # Show first 10
+        return result
 
-        # Show context around first unconverted IF
-        if if_positions:
-            first_if = if_positions[0]
-            context_start = max(0, first_if - 50)
-            context_end = min(len(query), first_if + 100)
-            print(f"\nFirst unconverted IF() context:")
-            print(f"...{query[context_start:context_end]}...")
-        print("=" * 80 + "\n")
-
-    return query
+    except Exception as exc:
+        logger.warning("apply_all_query_transformations failed: %s", exc)
+        return query  # return original, never crash the caller

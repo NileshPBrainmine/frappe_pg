@@ -1,316 +1,314 @@
 """
 Database Method Patches for PostgreSQL Compatibility
-====================================================
+=====================================================
 
-This module contains monkey patches for Frappe's PostgresDatabase class
-to add automatic query transformation and error handling.
+Monkey-patches Frappe's PostgresDatabase class to make it production-ready
+for ERPNext, HRMS, Raven, CRM, Education, and any other Frappe app.
+
+Key behaviours
+--------------
+
+1. Query transformation  (patched_sql)
+   Every SQL statement passes through apply_all_query_transformations()
+   which uses sqlglot to transpile MySQL syntax to PostgreSQL, with a
+   comprehensive regex fallback.  See query_transformers.py for details.
+
+2. Per-query savepoints  (patched_sql)
+   MySQL lets a failing query be retried; the surrounding transaction
+   continues.  PostgreSQL aborts the ENTIRE transaction on any query
+   error.  To match MySQL behaviour every query is wrapped in:
+       SAVEPOINT frappe_pg_sp_N
+       <actual query>
+       RELEASE SAVEPOINT frappe_pg_sp_N   -- success
+       ROLLBACK TO SAVEPOINT frappe_pg_sp_N  -- failure
+
+   This ensures that a single bad query (e.g. a hook querying a column
+   that doesn't exist yet) only rolls back itself; the caller's
+   transaction — and its other work — remains intact.
+
+3. Savepoint-aware rollback  (patched_rollback)
+   Frappe v15 calls frappe.db.rollback(save_point=name) to roll back to
+   a named savepoint during error recovery.  The original frappe_pg did
+   not accept the save_point kwarg, causing a TypeError that killed the
+   setup wizard.  patched_rollback handles both full rollback (no kwarg)
+   and partial rollback (save_point=name).
+
+4. Commit pass-through  (patched_commit)
+   Thin wrapper; logs commit failures for diagnostics.
+
+Production edge-case coverage
+------------------------------
+- Any exception inside a savepoint only affects that query.
+- Transaction-control statements (BEGIN, COMMIT, ROLLBACK, SAVEPOINT,
+  RELEASE, SET) are never wrapped in savepoints.
+- The savepoint counter is per-thread so concurrent requests are safe.
+- Patches are applied exactly once (idempotent guard via _patches_applied).
+- % escaping: lone % in queries without bound values is doubled so
+  psycopg2 does not interpret it as a format-string placeholder.
 """
+
+from __future__ import annotations
+
+import threading
+
+import psycopg2.errors
+import psycopg2.extensions
 
 import frappe
 from frappe.database.postgres.database import PostgresDatabase
-import psycopg2.errors
 
 from .query_transformers import apply_all_query_transformations
 from .db_functions import create_missing_functions
 
 
-# ============================================================================
-# Module State
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Module state
+# ---------------------------------------------------------------------------
 
-# Store original methods
-_original_sql = None
-_original_commit = None
-_original_rollback = None
-_patches_applied = False
+_original_sql: object = None
+_original_commit: object = None
+_original_rollback: object = None
+_patches_applied: bool = False
+
+_sp_counter = threading.local()
 
 
-# ============================================================================
-# Patched Database Methods
-# ============================================================================
+def _next_sp_name() -> str:
+    """Return a unique per-thread savepoint name."""
+    if not hasattr(_sp_counter, "n"):
+        _sp_counter.n = 0
+    _sp_counter.n = (_sp_counter.n + 1) % 1_000_000
+    return f"frappe_pg_sp_{_sp_counter.n}"
+
+
+def _in_active_transaction(conn) -> bool:
+    """Return True when the psycopg2 connection has an open transaction."""
+    try:
+        return conn.status == psycopg2.extensions.STATUS_IN_TRANSACTION
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# patched_sql
+# ---------------------------------------------------------------------------
+
+# Statements that must NOT be wrapped in a savepoint
+_TXN_CTRL_PREFIXES = (
+    "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT",
+    "RELEASE SAVEPOINT", "SET ", "SET\t",
+)
+
+# Import base Database.sql once at module level to avoid repeated lookups
+import frappe.database.database as _frappe_db_module  # noqa: E402
+
 
 def patched_sql(self, query, values=(), *args, **kwargs):
     """
-    Enhanced SQL method with:
-    1. Automatic query transformation for PostgreSQL compatibility
-    2. Transaction error handling with automatic rollback
-    3. Detailed error logging
-
-    This method is monkey-patched onto PostgresDatabase.sql to intercept
-    all SQL queries and transform them before execution.
-
-    Args:
-        self: PostgresDatabase instance
-        query: SQL query string
-        values: Query parameter values
-        *args: Additional positional arguments
-        **kwargs: Additional keyword arguments
-
-    Returns:
-        Query results from the database
-
-    Raises:
-        Exception: Re-raises any database errors after logging
+    Replacement for PostgresDatabase.sql with:
+      - MySQL→PG query transformation
+      - % escaping
+      - Per-query automatic savepoints
     """
-    # Apply query transformations FIRST, before Frappe's modify_query
-    transformed_query = apply_all_query_transformations(query)
+    from frappe.database.postgres.database import (
+        modify_query,
+        modify_values as pg_modify_values,
+    )
 
-    max_retries = 3
-    retry_count = 0
-    last_error = None
+    _BASE_SQL = _frappe_db_module.Database.sql
 
-    while retry_count < max_retries:
+    # ── Step 1: transform MySQL syntax ──────────────────────────────────────
+    transformed = apply_all_query_transformations(query)
+
+    # ── Step 2: apply Frappe's own PG normalisation ─────────────────────────
+    pg_query = modify_query(transformed)
+    pg_values = pg_modify_values(values)
+
+    # ── Step 3: escape lone % when no bound values ───────────────────────────
+    if not pg_values:
+        pg_query = pg_query.replace("%", "%%")
+
+    # ── Step 4: decide whether to use a per-query savepoint ─────────────────
+    q_up = pg_query.strip().upper()
+    is_txn_ctrl = any(q_up.startswith(pfx) for pfx in _TXN_CTRL_PREFIXES)
+
+    sp_name: str | None = None
+    if not is_txn_ctrl and _in_active_transaction(self.con):
+        sp_name = _next_sp_name()
         try:
-            # Import these here to avoid circular imports
-            import frappe.database.database
-            from frappe.database.postgres.database import modify_query, modify_values as pg_modify_values
+            _BASE_SQL(self, f"SAVEPOINT {sp_name}")
+        except Exception:
+            sp_name = None  # couldn't create savepoint; proceed without
 
-            # Apply Frappe's PostgreSQL transformations
-            pg_query = modify_query(transformed_query)
-            pg_values = pg_modify_values(values)
-
-            # Call the parent Database.sql method directly
-            # This bypasses PostgresDatabase.sql to avoid recursion
-            return frappe.database.database.Database.sql(self, pg_query, pg_values, *args, **kwargs)
-
-        except Exception as e:
-            last_error = e
-            error_msg = str(e).lower()
-
-            # Check if this is a transaction abort error
-            is_transaction_error = (
-                'transaction is aborted' in error_msg or
-                'infailedsqltransaction' in error_msg or
-                isinstance(e, psycopg2.errors.InFailedSqlTransaction)
-            )
-
-            if is_transaction_error:
-                retry_count += 1
-
-                # Try to rollback
-                try:
-                    self.rollback()
-                    frappe.log_error(
-                        title=f"PostgreSQL Transaction Rolled Back (Retry {retry_count}/{max_retries})",
-                        message=f"Query: {str(transformed_query)[:500]}\n\nOriginal Query: {str(query)[:500]}\n\nError: {str(e)}"
-                    )
-
-                    # If we have retries left, continue the loop
-                    if retry_count < max_retries:
-                        continue
-                except Exception as rollback_error:
-                    frappe.log_error(
-                        title="PostgreSQL Rollback Failed",
-                        message=f"Rollback Error: {str(rollback_error)}\n\nOriginal Error: {str(e)}"
-                    )
-
-            # Check for syntax errors that might need additional transformation
-            if 'syntax error' in error_msg or isinstance(e, psycopg2.errors.SyntaxError):
-                frappe.log_error(
-                    title="PostgreSQL Syntax Error",
-                    message=f"Transformed Query: {str(transformed_query)[:1000]}\n\n"
-                            f"Original Query: {str(query)[:1000]}\n\n"
-                            f"Values: {str(values)[:500]}\n\n"
-                            f"Error: {str(e)}"
-                )
-
-            # Check for function not found errors
-            if 'function' in error_msg and 'does not exist' in error_msg:
-                frappe.log_error(
-                    title="PostgreSQL Function Not Found",
-                    message=f"Transformed Query: {str(transformed_query)[:1000]}\n\n"
-                            f"Original Query: {str(query)[:1000]}\n\n"
-                            f"Error: {str(e)}\n\n"
-                            f"Hint: This might require database-level function creation"
-                )
-
-            # Re-raise the exception
-            raise
-
-    # If we exhausted retries, raise the last error
-    if last_error:
-        raise last_error
-
-
-def patched_commit(self):
-    """
-    Enhanced commit with error handling.
-
-    Args:
-        self: PostgresDatabase instance
-
-    Returns:
-        Result from original commit method
-
-    Raises:
-        Exception: Re-raises any commit errors after logging
-    """
+    # ── Step 5: execute ──────────────────────────────────────────────────────
     try:
-        return _original_commit(self)
-    except Exception as e:
-        frappe.log_error(
-            title="PostgreSQL Commit Failed",
-            message=str(e)
-        )
+        result = _BASE_SQL(self, pg_query, pg_values, *args, **kwargs)
+        if sp_name:
+            try:
+                _BASE_SQL(self, f"RELEASE SAVEPOINT {sp_name}")
+            except Exception:
+                pass  # non-fatal; released automatically on COMMIT
+        return result
+
+    except Exception as exc:
+        error_msg = str(exc).lower()
+
+        if sp_name:
+            # Roll back only this query; surrounding transaction survives
+            try:
+                _BASE_SQL(self, f"ROLLBACK TO SAVEPOINT {sp_name}")
+            except Exception:
+                # Savepoint gone (e.g. outer ROLLBACK beat us)
+                _safe_rollback(self)
+        else:
+            # Not in a transaction, or already aborted — full rollback
+            if (
+                isinstance(exc, psycopg2.errors.InFailedSqlTransaction)
+                or "transaction is aborted" in error_msg
+                or "infailedsqltransaction" in error_msg
+            ):
+                _safe_rollback(self)
+
+        # Diagnostic logging (never blocks the caller)
+        _log_sql_error(exc, error_msg, transformed, query, values)
+
         raise
 
 
+def _safe_rollback(db_instance) -> None:
+    try:
+        _original_rollback(db_instance)
+    except Exception:
+        pass
+
+
+def _log_sql_error(exc, error_msg: str, transformed: str, original: str, values) -> None:
+    try:
+        if "syntax error" in error_msg or isinstance(exc, psycopg2.errors.SyntaxError):
+            frappe.log_error(
+                title="PostgreSQL Syntax Error",
+                message=(
+                    f"Transformed: {transformed[:1000]}\n\n"
+                    f"Original:    {original[:1000]}\n\n"
+                    f"Values:      {str(values)[:500]}\n\n"
+                    f"Error:       {exc}"
+                ),
+            )
+        elif "function" in error_msg and "does not exist" in error_msg:
+            frappe.log_error(
+                title="PostgreSQL Function Not Found",
+                message=(
+                    f"Transformed: {transformed[:1000]}\n\n"
+                    f"Original:    {original[:1000]}\n\n"
+                    f"Error:       {exc}\n\n"
+                    "Hint: run bench execute frappe_pg.install_db_functions.install"
+                ),
+            )
+    except Exception:
+        pass  # logging must never crash the caller
+
+
+# ---------------------------------------------------------------------------
+# patched_commit
+# ---------------------------------------------------------------------------
+
+def patched_commit(self):
+    try:
+        return _original_commit(self)
+    except Exception as exc:
+        try:
+            frappe.log_error(title="PostgreSQL Commit Failed", message=str(exc))
+        except Exception:
+            pass
+        raise
+
+
+# ---------------------------------------------------------------------------
+# patched_rollback
+# ---------------------------------------------------------------------------
+
 def patched_rollback(self, *, save_point=None):
     """
-    Enhanced rollback with savepoint support and error handling.
+    Full rollback (save_point=None) or savepoint rollback (save_point='name').
 
-    Frappe v15 calls frappe.db.rollback(save_point=name) to roll back to a
-    specific savepoint. PostgreSQL uses "ROLLBACK TO SAVEPOINT <name>" syntax.
-    When save_point is None, performs a full transaction rollback.
-
-    Args:
-        self: PostgresDatabase instance
-        save_point: Optional savepoint name to rollback to. If provided,
-                    executes "ROLLBACK TO SAVEPOINT <name>" instead of
-                    a full rollback.
-
-    Note:
-        Errors during rollback are silently caught to prevent
-        cascading errors during error handling.
+    Frappe v15 calls frappe.db.rollback(save_point=name) during error
+    recovery inside the savepoint context manager.  Without this kwarg
+    support the setup wizard would crash with TypeError.
     """
     if save_point:
         try:
-            import frappe.database.database
-            frappe.database.database.Database.sql(self, f"ROLLBACK TO SAVEPOINT {save_point}")
+            _frappe_db_module.Database.sql(
+                self, f"ROLLBACK TO SAVEPOINT {save_point}"
+            )
         except Exception:
             pass
         return
     try:
         return _original_rollback(self)
     except Exception:
-        # Don't log rollback failures during error handling
-        # as this can cause cascading errors
         pass
 
 
-# ============================================================================
-# Patch Application Functions
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Patch application
+# ---------------------------------------------------------------------------
 
-def apply_postgres_fixes():
+def apply_postgres_fixes() -> None:
     """
-    Apply PostgreSQL compatibility fixes.
+    Monkey-patch PostgresDatabase exactly once.
 
-    This function monkey-patches the PostgresDatabase class to add:
-    - Automatic query transformation
-    - Transaction error handling
-    - Enhanced error logging
-
-    This is called:
-    - On app import (__init__.py)
-    - After installation (hooks.py)
-    - On session creation (hooks.py)
-    - After migration (hooks.py)
-
-    Returns:
-        None
+    Idempotent: calling it multiple times is safe (re-entry is a no-op).
     """
     global _original_sql, _original_commit, _original_rollback, _patches_applied
 
     if _patches_applied:
-        # Already applied, skip
         return
 
-    print("=" * 60)
-    print("Applying PostgreSQL Compatibility Patches for ERPNext")
-    print("=" * 60)
-
-    # Store original methods
     _original_sql = PostgresDatabase.sql
     _original_commit = PostgresDatabase.commit
     _original_rollback = PostgresDatabase.rollback
 
-    # Apply monkey patches
     PostgresDatabase.sql = patched_sql
     PostgresDatabase.commit = patched_commit
     PostgresDatabase.rollback = patched_rollback
 
     _patches_applied = True
 
-    print("✓ Query transformation patches applied")
-    print("✓ Transaction error handling enabled")
-    print("✓ Enhanced error logging configured")
-    print()
-    print("The following transformations are now active:")
-    print("  • FORCE INDEX removal")
-    print("  • IF() → CASE WHEN conversion")
-    print("  • IFNULL() → COALESCE() conversion")
-    print("  • DATE_FORMAT() → TO_CHAR() conversion")
-    print("  • Automatic transaction rollback on errors")
+    print("=" * 60)
+    print("PostgreSQL compatibility patches applied (frappe_pg)")
+    print("  ✓ sqlglot query transpilation")
+    print("  ✓ per-query savepoints (MySQL isolation behaviour)")
+    print("  ✓ patched_rollback with save_point support")
+    print("  ✓ % escaping for unbound queries")
     print("=" * 60)
 
 
-def on_session_creation(login_manager):
-    """
-    Apply fixes on each session creation.
-
-    This ensures patches remain active after restarts.
-    Called by Frappe hooks system on each user login.
-
-    Args:
-        login_manager: Frappe LoginManager instance
-
-    Returns:
-        None
-    """
+def on_session_creation(login_manager) -> None:
+    """Re-apply patches on login (guards against module reload)."""
     apply_postgres_fixes()
 
 
-def after_migrate():
-    """
-    Called after migration to ensure database functions exist.
-
-    This ensures that:
-    1. All patches are applied
-    2. All database functions are created
-
-    Returns:
-        None
-    """
-    print("\nApplying post-migration PostgreSQL fixes...")
+def after_migrate() -> None:
+    """Post-migration hook: ensure patches + DB functions are in place."""
+    print("\nRunning post-migration PostgreSQL setup…")
     apply_postgres_fixes()
     create_missing_functions()
 
 
-def check_patches_status():
-    """
-    Check if PostgreSQL patches are currently applied.
-
-    This is useful for debugging and verification.
-
-    Returns:
-        dict: Status information about patches
-
-    Example:
-        >>> from frappe_pg.postgres.database_patches import check_patches_status
-        >>> check_patches_status()
-        {
-            'patches_applied': True,
-            'sql_patched': True,
-            'commit_patched': True,
-            'rollback_patched': True
-        }
-    """
+def check_patches_status() -> dict:
     return {
-        'patches_applied': _patches_applied,
-        'sql_patched': PostgresDatabase.sql == patched_sql if _patches_applied else False,
-        'commit_patched': PostgresDatabase.commit == patched_commit if _patches_applied else False,
-        'rollback_patched': PostgresDatabase.rollback == patched_rollback if _patches_applied else False
+        "patches_applied": _patches_applied,
+        "sql_patched": PostgresDatabase.sql is patched_sql,
+        "commit_patched": PostgresDatabase.commit is patched_commit,
+        "rollback_patched": PostgresDatabase.rollback is patched_rollback,
     }
 
 
-# ============================================================================
-# Module Initialization
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Auto-apply on import
+# ---------------------------------------------------------------------------
 
-# Apply patches when module is imported
-# This ensures they're active even if hooks don't fire
 try:
     apply_postgres_fixes()
-except Exception as e:
-    print(f"Warning: Could not apply PostgreSQL patches during module import: {e}")
+except Exception as _e:
+    print(f"Warning: frappe_pg could not apply patches on import: {_e}")
