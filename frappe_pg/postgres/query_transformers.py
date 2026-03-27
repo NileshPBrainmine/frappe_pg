@@ -496,12 +496,27 @@ def _legacy_transform(sql: str) -> str:
 
 _SPACED_PLACEHOLDER_RE = re.compile(r"%\s+s")
 
+# CREATE INDEX column fix: sqlglot reads MySQL dialect where "col" is a string literal,
+# so it converts "col_name" identifiers in CREATE INDEX → 'col_name' NULLS FIRST.
+# PostgreSQL requires double-quoted identifiers, not single-quoted strings.
+# Pattern matches: 'identifier' NULLS FIRST  or  'identifier' NULLS LAST
+_INDEX_COL_SINGLEQUOTED_RE = re.compile(
+    r"'([A-Za-z_][A-Za-z0-9_ ]*)'\s+NULLS\s+(?:FIRST|LAST)",
+    re.IGNORECASE,
+)
+
 
 def _post_sqlglot_fixups(sql: str) -> str:
     """Apply targeted fixups after sqlglot transpilation."""
     # sqlglot may add spaces around psycopg2 placeholders: '%s' → ' % s'
     # which causes ValueError: unsupported format character ' ' (0x20)
     sql = _SPACED_PLACEHOLDER_RE.sub("%s", sql)
+
+    # Fix CREATE INDEX column identifiers corrupted by sqlglot MySQL dialect parsing.
+    # sqlglot treats "col" as a MySQL string literal → 'col' NULLS FIRST.
+    # Restore to proper PostgreSQL double-quoted identifiers.
+    if re.search(r"\bNULLS\s+(?:FIRST|LAST)\b", sql, re.IGNORECASE):
+        sql = _INDEX_COL_SINGLEQUOTED_RE.sub(r'"\1"', sql)
 
     # DATE_FORMAT safety net (sqlglot handles common cases; catch stragglers)
     if re.search(r"\bDATE_FORMAT\b", sql, re.IGNORECASE):
