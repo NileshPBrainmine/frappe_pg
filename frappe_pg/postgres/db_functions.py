@@ -72,15 +72,18 @@ def _exec(statements: list[str]) -> tuple[int, int]:
     """Run each statement; return (success_count, error_count)."""
     ok = 0
     err = 0
+    # Use direct connection to bypass query transformation for DDL.
+    # Frappe v15 uses frappe.db.conn; older versions used frappe.db._conn.
+    _db_conn = getattr(frappe.db, "conn", None) or getattr(frappe.db, "_conn", None)
     for sql in statements:
         sql = sql.strip()
         if not sql:
             continue
         try:
-            if hasattr(frappe.db, "_conn") and frappe.db._conn:
-                cur = frappe.db._conn.cursor()
+            if _db_conn:
+                cur = _db_conn.cursor()
                 cur.execute(sql)
-                frappe.db._conn.commit()
+                _db_conn.commit()
             else:
                 frappe.db.sql(sql)
                 frappe.db.commit()
@@ -150,7 +153,7 @@ _FUNCTIONS: list[str] = [
     # ------------------------------------------------------------------
     """
     CREATE OR REPLACE FUNCTION unix_timestamp(ts timestamptz DEFAULT NOW())
-    RETURNS bigint LANGUAGE sql IMMUTABLE AS $$
+    RETURNS bigint LANGUAGE sql STABLE AS $$
         SELECT EXTRACT(EPOCH FROM ts)::bigint
     $$
     """,
@@ -268,6 +271,46 @@ _FUNCTIONS: list[str] = [
     """,
     """
     CREATE OR REPLACE FUNCTION second(ts timestamp)     RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT EXTRACT(SECOND FROM ts)::integer $$
+    """,
+
+    # Time type overloads — HRMS stores attendance times as TIME type
+    """
+    CREATE OR REPLACE FUNCTION hour(t time)             RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT EXTRACT(HOUR   FROM t)::integer $$
+    """,
+    """
+    CREATE OR REPLACE FUNCTION minute(t time)           RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT EXTRACT(MINUTE FROM t)::integer $$
+    """,
+    """
+    CREATE OR REPLACE FUNCTION second(t time)           RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT EXTRACT(SECOND FROM t)::integer $$
+    """,
+
+    # Text overloads — ERPNext sometimes passes date strings directly
+    """
+    CREATE OR REPLACE FUNCTION month(d text)      RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT EXTRACT(MONTH   FROM d::date)::integer $$
+    """,
+    """
+    CREATE OR REPLACE FUNCTION year(d text)       RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT EXTRACT(YEAR    FROM d::date)::integer $$
+    """,
+    """
+    CREATE OR REPLACE FUNCTION day(d text)        RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT EXTRACT(DAY     FROM d::date)::integer $$
+    """,
+    """
+    CREATE OR REPLACE FUNCTION dayofmonth(d text) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT EXTRACT(DAY     FROM d::date)::integer $$
+    """,
+    """
+    CREATE OR REPLACE FUNCTION dayofyear(d text)  RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT EXTRACT(DOY     FROM d::date)::integer $$
+    """,
+    """
+    CREATE OR REPLACE FUNCTION weekofyear(d text) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT EXTRACT(WEEK    FROM d::date)::integer $$
+    """,
+    """
+    CREATE OR REPLACE FUNCTION week(d text)       RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT EXTRACT(WEEK    FROM d::date)::integer $$
+    """,
+    """
+    CREATE OR REPLACE FUNCTION quarter(d text)    RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT EXTRACT(QUARTER FROM d::date)::integer $$
+    """,
+    """
+    CREATE OR REPLACE FUNCTION dayofweek(d text)  RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT (EXTRACT(DOW FROM d::date)::integer + 1) $$
     """,
 
     # ------------------------------------------------------------------
@@ -494,6 +537,55 @@ _FUNCTIONS: list[str] = [
     """,
 
     # ------------------------------------------------------------------
+    # MK_TIMESTAMP(date, time)  — ERPNext TIMESTAMP(posting_date, posting_time)
+    # Replaces MySQL's two-arg TIMESTAMP() function.
+    # ------------------------------------------------------------------
+    """
+    CREATE OR REPLACE FUNCTION mk_timestamp(d date, t text)
+    RETURNS timestamp LANGUAGE sql IMMUTABLE AS $$
+        SELECT (d::text || ' ' || t)::timestamp
+    $$
+    """,
+
+    """
+    CREATE OR REPLACE FUNCTION mk_timestamp(d text, t text)
+    RETURNS timestamp LANGUAGE sql IMMUTABLE AS $$
+        SELECT (d || ' ' || t)::timestamp
+    $$
+    """,
+
+    """
+    CREATE OR REPLACE FUNCTION mk_timestamp(d date, t time)
+    RETURNS timestamp LANGUAGE sql IMMUTABLE AS $$
+        SELECT (d + t)::timestamp
+    $$
+    """,
+
+    # ------------------------------------------------------------------
+    # SUBSTRING_INDEX(str, delim, count)
+    # MySQL: positive count = from left, negative = from right
+    # ------------------------------------------------------------------
+    """
+    CREATE OR REPLACE FUNCTION substring_index(str text, delim text, cnt integer)
+    RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
+    DECLARE
+        arr text[];
+        n   integer;
+    BEGIN
+        IF str IS NULL OR delim IS NULL THEN RETURN NULL; END IF;
+        arr := STRING_TO_ARRAY(str, delim);
+        n   := ARRAY_LENGTH(arr, 1);
+        IF n IS NULL THEN RETURN str; END IF;
+        IF cnt >= 0 THEN
+            RETURN ARRAY_TO_STRING(arr[1 : LEAST(cnt, n)], delim);
+        ELSE
+            RETURN ARRAY_TO_STRING(arr[GREATEST(1, n + cnt + 1) : n], delim);
+        END IF;
+    END
+    $$
+    """,
+
+    # ------------------------------------------------------------------
     # PERIOD_ADD(period, n)  — add n months to YYYYMM
     # ------------------------------------------------------------------
     """
@@ -617,6 +709,18 @@ def drop_all_functions() -> None:
         "DROP FUNCTION IF EXISTS hour(timestamp) CASCADE",
         "DROP FUNCTION IF EXISTS minute(timestamp) CASCADE",
         "DROP FUNCTION IF EXISTS second(timestamp) CASCADE",
+        "DROP FUNCTION IF EXISTS hour(time) CASCADE",
+        "DROP FUNCTION IF EXISTS minute(time) CASCADE",
+        "DROP FUNCTION IF EXISTS second(time) CASCADE",
+        "DROP FUNCTION IF EXISTS month(text) CASCADE",
+        "DROP FUNCTION IF EXISTS year(text) CASCADE",
+        "DROP FUNCTION IF EXISTS day(text) CASCADE",
+        "DROP FUNCTION IF EXISTS dayofmonth(text) CASCADE",
+        "DROP FUNCTION IF EXISTS dayofyear(text) CASCADE",
+        "DROP FUNCTION IF EXISTS weekofyear(text) CASCADE",
+        "DROP FUNCTION IF EXISTS week(text) CASCADE",
+        "DROP FUNCTION IF EXISTS quarter(text) CASCADE",
+        "DROP FUNCTION IF EXISTS dayofweek(text) CASCADE",
         "DROP FUNCTION IF EXISTS to_days(date) CASCADE",
         "DROP FUNCTION IF EXISTS from_days(integer) CASCADE",
         "DROP FUNCTION IF EXISTS period_diff(integer, integer) CASCADE",
@@ -638,6 +742,10 @@ def drop_all_functions() -> None:
         "DROP FUNCTION IF EXISTS curdate() CASCADE",
         "DROP FUNCTION IF EXISTS curtime() CASCADE",
         "DROP FUNCTION IF EXISTS sysdate() CASCADE",
+        "DROP FUNCTION IF EXISTS mk_timestamp(date, text) CASCADE",
+        "DROP FUNCTION IF EXISTS mk_timestamp(text, text) CASCADE",
+        "DROP FUNCTION IF EXISTS mk_timestamp(date, time) CASCADE",
+        "DROP FUNCTION IF EXISTS substring_index(text, text, integer) CASCADE",
     ]
     _exec(drops)
     print("✓  All PostgreSQL compatibility functions dropped")

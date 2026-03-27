@@ -85,7 +85,12 @@ _MYSQL_MARKER_RE = re.compile(
     r"|\bFIND_IN_SET\s*\("                         # FIND_IN_SET(
     r"|\bFIELD\s*\("                               # FIELD(
     r"|\bCAST\s*\([^)]+\bAS\s+(?:UNSIGNED|SIGNED|CHAR)\b"  # CAST(x AS UNSIGNED/SIGNED/CHAR)
-    r"|\bISNULL\s*\(",                             # ISNULL(
+    r"|\bISNULL\s*\("                              # ISNULL(
+    r"|\bDATE_ADD\s*\("                            # DATE_ADD(
+    r"|\bDATE_SUB\s*\("                            # DATE_SUB(
+    r"|\bADDDATE\s*\("                             # ADDDATE(
+    r"|\bSUBDATE\s*\("                             # SUBDATE(
+    r"|\bSUBSTRING_INDEX\s*\(",                    # SUBSTRING_INDEX(
     re.IGNORECASE,
 )
 
@@ -96,14 +101,81 @@ _DATEDIFF_PRE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# TIMESTAMP(date, time) — MySQL two-arg form creates a datetime from date+time.
+# PostgreSQL has no such function; use mk_timestamp() DB-level function instead.
+# Must NOT match TIMESTAMPDIFF (word boundary + no trailing DIFF keyword).
+_TIMESTAMP_2ARG_RE = re.compile(
+    r"\bTIMESTAMP\s*\(\s*([^,)(]+?)\s*,\s*([^)(]+?)\s*\)",
+    re.IGNORECASE,
+)
+# TIMESTAMP(expr) single-arg form → cast to timestamp.
+# Exclude pure-digit args like TIMESTAMP(6) which are precision specifiers in DDL.
+_TIMESTAMP_1ARG_RE = re.compile(
+    r"\bTIMESTAMP\s*\(\s*([^)(]+?)\s*\)",
+    re.IGNORECASE,
+)
+
+# INTERVAL 'N' UNIT  (Frappe core pattern: NOW() - INTERVAL '7' DAY)
+# PostgreSQL requires INTERVAL '7 days' not INTERVAL '7' DAY.
+_INTERVAL_QUOTED_NUM_RE = re.compile(
+    r"\bINTERVAL\s+'(-?\d+)'\s+(SECOND|MINUTE|HOUR|DAY|WEEK|MONTH|YEAR)S?\b",
+    re.IGNORECASE,
+)
+
+# INTERVAL N UNIT (bare unquoted: INTERVAL 1 DAY) — outside of DATE_ADD context.
+# sqlglot handles DATE_ADD(x, INTERVAL 1 DAY) but standalone bare INTERVAL needs fixing.
+_INTERVAL_BARE_RE = re.compile(
+    r"\bINTERVAL\s+(-?\d+)\s+(SECOND|MINUTE|HOUR|DAY|WEEK|MONTH|YEAR)S?\b",
+    re.IGNORECASE,
+)
+
+# ADDDATE / SUBDATE — MySQL aliases for DATE_ADD / DATE_SUB; normalise before sqlglot.
+_ADDDATE_RE = re.compile(r"\bADDDATE\s*\(", re.IGNORECASE)
+_SUBDATE_RE = re.compile(r"\bSUBDATE\s*\(", re.IGNORECASE)
+
+# SUBSTRING_INDEX(str, delim, count) — no PostgreSQL built-in; use DB-level function.
+_SUBSTRING_INDEX_RE = re.compile(
+    r"\bSUBSTRING_INDEX\s*\(\s*(.+?)\s*,\s*(.+?)\s*,\s*(-?\d+)\s*\)",
+    re.IGNORECASE,
+)
+
 
 def _preprocess(sql: str) -> str:
-    """Strip index hints, fix REGEXP/DATEDIFF before handing to sqlglot."""
+    """Strip index hints and fix MySQL-specific constructs before handing to sqlglot."""
     sql = _INDEX_HINT_RE.sub("", sql)
     sql = _REGEXP_PRE_RE.sub("~*", sql)
     sql = _DATEDIFF_PRE_RE.sub(
         lambda m: f"({m.group(1).strip()}::date - {m.group(2).strip()}::date)", sql
     )
+
+    # TIMESTAMP(date, time) → mk_timestamp(date, time) [DB-level function]
+    # Do 2-arg before 1-arg to avoid partial matches.
+    sql = _TIMESTAMP_2ARG_RE.sub(
+        lambda m: f"mk_timestamp({m.group(1).strip()}, {m.group(2).strip()})", sql
+    )
+    # TIMESTAMP(expr) single-arg — only when arg is not a bare integer (DDL precision).
+    def _timestamp_1arg(m: re.Match) -> str:
+        arg = m.group(1).strip()
+        if arg.isdigit():
+            return m.group(0)  # TIMESTAMP(6) — leave DDL precision alone
+        return f"({arg})::timestamp"
+    sql = _TIMESTAMP_1ARG_RE.sub(_timestamp_1arg, sql)
+
+    # INTERVAL 'N' UNIT → INTERVAL 'N units'
+    sql = _INTERVAL_QUOTED_NUM_RE.sub(
+        lambda m: f"INTERVAL '{m.group(1)} {m.group(2).lower()}s'", sql
+    )
+    # INTERVAL N UNIT (bare) → INTERVAL 'N units'
+    # Only apply outside DATE_ADD/DATE_SUB (those go to sqlglot which handles them).
+    # We apply here too as a safety net; sqlglot reads PG-style INTERVAL fine.
+    sql = _INTERVAL_BARE_RE.sub(
+        lambda m: f"INTERVAL '{m.group(1)} {m.group(2).lower()}s'", sql
+    )
+
+    # ADDDATE/SUBDATE → DATE_ADD/DATE_SUB so sqlglot transpiles them correctly.
+    sql = _ADDDATE_RE.sub("DATE_ADD(", sql)
+    sql = _SUBDATE_RE.sub("DATE_SUB(", sql)
+
     return sql
 
 
@@ -180,6 +252,16 @@ _DATE_FORMAT_MAP: list[tuple[re.Pattern, str]] = [
      r"TO_CHAR(\1, 'IW')"),
     (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%j'\s*\)", re.I | re.S),
      r"TO_CHAR(\1, 'DDD')"),
+    (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%m-%Y'\s*\)", re.I | re.S),
+     r"TO_CHAR(\1, 'MM-YYYY')"),
+    (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%Y-%m-%d %H:%i'\s*\)", re.I | re.S),
+     r"TO_CHAR(\1, 'YYYY-MM-DD HH24:MI')"),
+    (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%d %b %Y'\s*\)", re.I | re.S),
+     r"TO_CHAR(\1, 'DD Mon YYYY')"),
+    (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%e'\s*\)", re.I | re.S),
+     r"TO_CHAR(\1, 'FMDD')"),
+    (re.compile(r"\bDATE_FORMAT\s*\(\s*(.+?)\s*,\s*'%c'\s*\)", re.I | re.S),
+     r"TO_CHAR(\1, 'FMMM')"),
     # Catch-all: any remaining DATE_FORMAT → TO_CHAR (args passed through)
     (re.compile(r"\bDATE_FORMAT\s*\(", re.I),
      r"TO_CHAR("),
@@ -400,6 +482,11 @@ def _legacy_transform(sql: str) -> str:
     sql = _fix_field_function(sql)
     sql = _fix_find_in_set(sql)
     sql = _fix_regexp(sql)
+    if re.search(r"\bSUBSTRING_INDEX\b", sql, re.IGNORECASE):
+        sql = _SUBSTRING_INDEX_RE.sub(
+            lambda m: f"substring_index({m.group(1).strip()}, {m.group(2).strip()}, {m.group(3).strip()})",
+            sql,
+        )
     return sql
 
 
@@ -440,6 +527,13 @@ def _post_sqlglot_fixups(sql: str) -> str:
     # FIND_IN_SET
     if re.search(r"\bFIND_IN_SET\b", sql, re.IGNORECASE):
         sql = _fix_find_in_set(sql)
+
+    # SUBSTRING_INDEX → substring_index() DB-level function
+    if re.search(r"\bSUBSTRING_INDEX\b", sql, re.IGNORECASE):
+        sql = _SUBSTRING_INDEX_RE.sub(
+            lambda m: f"substring_index({m.group(1).strip()}, {m.group(2).strip()}, {m.group(3).strip()})",
+            sql,
+        )
 
     return sql
 

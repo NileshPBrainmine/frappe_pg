@@ -285,9 +285,24 @@ def apply_postgres_fixes() -> None:
     print("=" * 60)
 
 
+def _apply_trends_patch_safe() -> None:
+    """Apply the ERPNext trends GROUP BY patch; silently skip if ERPNext is absent."""
+    try:
+        from frappe_pg.patches.v1.fix_erpnext_trends import apply_trends_patch
+        apply_trends_patch()
+    except ImportError:
+        pass  # ERPNext not installed
+    except Exception as e:
+        try:
+            frappe.log_error(title="frappe_pg trends patch failed", message=str(e))
+        except Exception:
+            pass
+
+
 def on_session_creation(login_manager) -> None:
     """Re-apply patches on login (guards against module reload)."""
     apply_postgres_fixes()
+    _apply_trends_patch_safe()
 
 
 def after_migrate() -> None:
@@ -295,6 +310,7 @@ def after_migrate() -> None:
     print("\nRunning post-migration PostgreSQL setup…")
     apply_postgres_fixes()
     create_missing_functions()
+    _apply_trends_patch_safe()
 
 
 def check_patches_status() -> dict:

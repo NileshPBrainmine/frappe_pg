@@ -22,7 +22,8 @@ def install():
 
     try:
         # Import and apply the patches first
-        from frappe_pg.patches.postgres_fix import apply_postgres_fixes, create_missing_functions
+        from frappe_pg.postgres.database_patches import apply_postgres_fixes
+        from frappe_pg.postgres.db_functions import create_missing_functions
 
         print("\n1. Applying query transformation patches...")
         apply_postgres_fixes()

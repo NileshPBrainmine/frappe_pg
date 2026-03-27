@@ -18,7 +18,7 @@ Repository: https://github.com/excel-azmin/frappe_pg.git
 """
 
 __version__ = "1.0.0"
-__author__ = "Frappe PostgreSQL Team"
+__author__ = "Nilesh Patil"
 __license__ = "MIT"
 
 # Import and apply patches immediately when the app loads

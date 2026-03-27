@@ -1,8 +1,8 @@
 app_name = "frappe_pg"
 app_title = "Frappe PostgreSQL Compatibility"
-app_publisher = "Shaid Azmin"
+app_publisher = "Nilesh Patil"
 app_description = "Comprehensive PostgreSQL compatibility layer for Frappe/ERPNext"
-app_email = "azmin@excelbd.com"
+app_email = "ptilnilesh0278@gmail.com"
 app_license = "MIT"
 app_version = "1.0.0"
 
