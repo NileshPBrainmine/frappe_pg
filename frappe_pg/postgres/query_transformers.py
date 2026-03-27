@@ -564,6 +564,15 @@ def _post_sqlglot_fixups(sql: str) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
+# DDL statements that define or drop database objects whose signatures may
+# contain MySQL function names as identifiers (not as SQL calls to transform).
+# For example: CREATE FUNCTION datediff(d1, d2) → _DATEDIFF_PRE_RE mangles it.
+_FUNC_DDL_RE = re.compile(
+    r"^\s*(?:CREATE|DROP)\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|AGGREGATE|PROCEDURE|TRIGGER)\b",
+    re.IGNORECASE,
+)
+
+
 def apply_all_query_transformations(query: str) -> str:
     """
     Transform a MySQL/MariaDB SQL query to PostgreSQL-compatible SQL.
@@ -571,9 +580,11 @@ def apply_all_query_transformations(query: str) -> str:
     Pipeline
     --------
     1. Guard:   non-string or empty → return as-is
-    2. Pre:     strip FORCE/USE/IGNORE INDEX hints
-    3. Stage 1: sqlglot MySQL→PG transpilation (handles ~95 % of cases)
-    4. Stage 2: post-sqlglot fixups for edge cases
+    2. Guard:   CREATE/DROP FUNCTION/AGGREGATE DDL → return as-is (function
+                signatures contain MySQL names as identifiers, not SQL calls)
+    3. Pre:     strip FORCE/USE/IGNORE INDEX hints
+    4. Stage 1: sqlglot MySQL→PG transpilation (handles ~95 % of cases)
+    5. Stage 2: post-sqlglot fixups for edge cases
        - or -
        Fallback: legacy regex pipeline when sqlglot fails/unavailable
 
@@ -582,6 +593,12 @@ def apply_all_query_transformations(query: str) -> str:
     so that production traffic is never blocked by a transformation bug.
     """
     if not isinstance(query, str) or not query.strip():
+        return query
+
+    # Skip transformation for function/aggregate DDL. These definitions contain
+    # MySQL function names as their own identifiers (e.g. CREATE FUNCTION datediff),
+    # which preprocessing would mangle (datediff( → (d1::date - d2::date)).
+    if _FUNC_DDL_RE.search(query):
         return query
 
     try:

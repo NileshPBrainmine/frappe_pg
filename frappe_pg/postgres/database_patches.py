@@ -255,6 +255,33 @@ def patched_rollback(self, *, save_point=None):
 # Patch application
 # ---------------------------------------------------------------------------
 
+def _register_naive_timestamptz() -> None:
+    """
+    Register a psycopg2 type caster that strips tzinfo from TIMESTAMPTZ results.
+
+    PostgreSQL TIMESTAMPTZ columns return timezone-aware datetimes via psycopg2.
+    Frappe's codebase assumes naive datetimes throughout (no tzinfo), so comparing
+    a DB-returned datetime with a parsed string datetime raises:
+        TypeError: can't compare offset-naive and offset-aware datetimes
+    Stripping tzinfo at the driver level fixes this globally.
+    """
+    try:
+        def _cast_timestamptz_naive(value, cursor):
+            dt = psycopg2.extensions.PYDATETIMETZ(value, cursor)
+            if dt is not None and dt.tzinfo is not None:
+                return dt.replace(tzinfo=None)
+            return dt
+
+        _NAIVE_DATETIMETZ = psycopg2.extensions.new_type(
+            psycopg2.extensions.PYDATETIMETZ.values,
+            "NAIVE_DATETIMETZ",
+            _cast_timestamptz_naive,
+        )
+        psycopg2.extensions.register_type(_NAIVE_DATETIMETZ)
+    except Exception:
+        pass  # Never block startup
+
+
 def apply_postgres_fixes() -> None:
     """
     Monkey-patch PostgresDatabase exactly once.
@@ -265,6 +292,10 @@ def apply_postgres_fixes() -> None:
 
     if _patches_applied:
         return
+
+    # Strip tzinfo from TIMESTAMPTZ results so Frappe's naive-datetime
+    # comparisons don't raise TypeError.
+    _register_naive_timestamptz()
 
     _original_sql = PostgresDatabase.sql
     _original_commit = PostgresDatabase.commit
