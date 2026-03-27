@@ -494,8 +494,15 @@ def _legacy_transform(sql: str) -> str:
 # Post-sqlglot fixups (patterns sqlglot may not cover fully)
 # ---------------------------------------------------------------------------
 
+_SPACED_PLACEHOLDER_RE = re.compile(r"%\s+s")
+
+
 def _post_sqlglot_fixups(sql: str) -> str:
     """Apply targeted fixups after sqlglot transpilation."""
+    # sqlglot may add spaces around psycopg2 placeholders: '%s' → ' % s'
+    # which causes ValueError: unsupported format character ' ' (0x20)
+    sql = _SPACED_PLACEHOLDER_RE.sub("%s", sql)
+
     # DATE_FORMAT safety net (sqlglot handles common cases; catch stragglers)
     if re.search(r"\bDATE_FORMAT\b", sql, re.IGNORECASE):
         for pattern, replacement in _DATE_FORMAT_MAP:
