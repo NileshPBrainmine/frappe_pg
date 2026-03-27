@@ -487,6 +487,8 @@ def _legacy_transform(sql: str) -> str:
             lambda m: f"substring_index({m.group(1).strip()}, {m.group(2).strip()}, {m.group(3).strip()})",
             sql,
         )
+    if "%s" in sql and re.search(r"(?i)LIKE\s+'[^']*%s", sql):
+        sql = _fix_like_param_in_literal(sql)
     return sql
 
 
@@ -505,12 +507,53 @@ _INDEX_COL_SINGLEQUOTED_RE = re.compile(
     re.IGNORECASE,
 )
 
+# LIKE '%%prefix%s%%suffix' → LIKE '%%prefix' || %s || '%%suffix'
+#
+# Problem: MySQL double-quoted LIKE patterns like `data LIKE "%%%s%%"` are
+# converted by sqlglot to single-quoted `LIKE '%%%s%%'`.  psycopg2 then does
+# string-level substitution without understanding SQL quoting context:
+#   %%  → % (literal percent)
+#   %s  → 'stop_birthday_reminders'  (with quotes added by psycopg2)
+#   %%  → %
+# Producing: LIKE '%'stop_birthday_reminders'%'  ← broken SQL
+#
+# Fix: extract %s from inside the string literal and use || concatenation:
+#   LIKE '%%' || %s || '%%'
+# psycopg2 then substitutes %s normally:
+#   LIKE '%' || 'stop_birthday_reminders' || '%'  ← valid PostgreSQL
+_LIKE_PARAM_IN_LITERAL_RE = re.compile(
+    r"(?i)(LIKE\s+)'((?:[^'%]|%%)*?)%s((?:[^'%]|%%)*?)'"
+)
+
+
+def _fix_like_param_in_literal(sql: str) -> str:
+    """Rewrite LIKE '%%...%s...%%' to use || concatenation instead of embedded %s."""
+    def _repl(m: re.Match) -> str:
+        keyword = m.group(1)
+        prefix = m.group(2)  # e.g. '%%'
+        suffix = m.group(3)  # e.g. '%%'
+        parts: list[str] = []
+        if prefix:
+            parts.append(f"'{prefix}'")
+        parts.append("%s")
+        if suffix:
+            parts.append(f"'{suffix}'")
+        if len(parts) == 1:
+            return f"{keyword}%s"
+        return keyword + " || ".join(parts)
+    return _LIKE_PARAM_IN_LITERAL_RE.sub(_repl, sql)
+
 
 def _post_sqlglot_fixups(sql: str) -> str:
     """Apply targeted fixups after sqlglot transpilation."""
     # sqlglot may add spaces around psycopg2 placeholders: '%s' → ' % s'
     # which causes ValueError: unsupported format character ' ' (0x20)
     sql = _SPACED_PLACEHOLDER_RE.sub("%s", sql)
+
+    # Fix LIKE '%%...%s...%%' patterns where psycopg2 embeds quoted values
+    # inside a string literal, producing broken SQL like '%'value'%'.
+    if "%s" in sql and re.search(r"(?i)LIKE\s+'[^']*%s", sql):
+        sql = _fix_like_param_in_literal(sql)
 
     # Fix CREATE INDEX column identifiers corrupted by sqlglot MySQL dialect parsing.
     # sqlglot treats "col" as a MySQL string literal → 'col' NULLS FIRST.

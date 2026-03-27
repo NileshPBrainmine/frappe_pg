@@ -366,19 +366,16 @@ _FUNCTIONS: list[str] = [
     """,
 
     # ------------------------------------------------------------------
-    # DATE(timestamp) / TIME(timestamp)
+    # DATE(timestamp)
+    # Note: time(ts) is intentionally omitted — PostgreSQL treats `time`
+    # as a reserved type keyword, so CREATE FUNCTION time(...) raises a
+    # syntax error.  MySQL's time(ts) behaviour (cast to time) is already
+    # provided natively by PostgreSQL's own type-cast syntax: ts::time.
     # ------------------------------------------------------------------
     """
     CREATE OR REPLACE FUNCTION date(ts timestamp)
     RETURNS date LANGUAGE sql IMMUTABLE AS $$
         SELECT ts::date
-    $$
-    """,
-
-    """
-    CREATE OR REPLACE FUNCTION time(ts timestamp)
-    RETURNS time LANGUAGE sql IMMUTABLE AS $$
-        SELECT ts::time
     $$
     """,
 
@@ -727,7 +724,6 @@ def drop_all_functions() -> None:
         "DROP FUNCTION IF EXISTS period_add(integer, integer) CASCADE",
         "DROP FUNCTION IF EXISTS str_to_date(text, text) CASCADE",
         "DROP FUNCTION IF EXISTS date(timestamp) CASCADE",
-        "DROP FUNCTION IF EXISTS time(timestamp) CASCADE",
         "DROP FUNCTION IF EXISTS rand() CASCADE",
         "DROP FUNCTION IF EXISTS instr(text, text) CASCADE",
         "DROP FUNCTION IF EXISTS locate(text, text) CASCADE",
