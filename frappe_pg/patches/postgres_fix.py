@@ -507,6 +507,12 @@ def create_missing_functions():
             error_msg = str(e).lower()
             if 'already exists' not in error_msg:
                 error_count += 1
+                if hasattr(frappe.db, '_conn') and frappe.db._conn:
+                    try: frappe.db._conn.rollback()
+                    except: pass
+                else:
+                    try: frappe.db.rollback()
+                    except: pass
                 print(f"  ⚠ Warning: {str(e)[:100]}")
 
     if error_count == 0:

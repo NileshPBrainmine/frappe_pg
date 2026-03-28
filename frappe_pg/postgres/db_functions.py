@@ -40,7 +40,6 @@ Functions / aggregates provided
   period_diff(p1, p2)                   diff in months between YYYYMM periods
   str_to_date(str, fmt)                 parse date string
   date(ts)                              extract date part from timestamp
-  time(ts)                              extract time part from timestamp
   date_format_compat(d, fmt)            DATE_FORMAT fall-through helper
   field(val VARIADIC any)               MySQL FIELD() positional match
   find_in_set(val, set_str)             MySQL FIND_IN_SET
@@ -92,7 +91,16 @@ def _exec(statements: list[str]) -> tuple[int, int]:
             msg = str(e).lower()
             if "already exists" not in msg:
                 err += 1
+                if _db_conn:
+                    try: _db_conn.rollback()
+                    except: pass
+                else:
+                    try: frappe.db.rollback()
+                    except: pass
+                
+                query_peek = sql[:100].replace("\n", " ") + "..." if len(sql) > 100 else sql.replace("\n", " ")
                 print(f"  ⚠  Warning: {str(e)[:120]}")
+                print(f"     at query: {query_peek}")
     return ok, err
 
 
