@@ -641,7 +641,10 @@ def apply_all_query_transformations(query: str) -> str:
     # Skip transformation for function/aggregate DDL. These definitions contain
     # MySQL function names as their own identifiers (e.g. CREATE FUNCTION datediff),
     # which preprocessing would mangle (datediff( → (d1::date - d2::date)).
-    if _FUNC_DDL_RE.search(query):
+    # We use lstrip() here to ensure leading newlines from triple-quoted strings
+    # don't break the start-of-string detection.
+    sq_strip = query.lstrip().lower()
+    if sq_strip.startswith(('create ', 'drop ', 'alter ', 'truncate ', 'grant ', 'revoke ')):
         return query
 
     try:
